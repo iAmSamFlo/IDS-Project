@@ -1,199 +1,239 @@
 import com.rabbitmq.client.ConnectionFactory;
 import com.rabbitmq.client.Connection;
 import com.rabbitmq.client.DeliverCallback;
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.UnsupportedEncodingException;
-import java.util.Random;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.io.Serializable;
+import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.Scanner;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeoutException;
 import java.lang.Thread;
 import com.rabbitmq.client.Channel;
 
+class RoutingEntry implements Serializable{
+  int distance;
+  int nextHop;
 
-// RULES and explainations are below
-// This version has many edgeguards against bad input. It can be shortend for better readability at the cost of throwing exceptions when receiving bad channel input or similar breaches of contract.
+  RoutingEntry(int distance, int nextHop){
+    this.distance = distance;
+    this.nextHop = nextHop;
+  }
+
+}
+
+class RoutingTable{
+  private ConcurrentHashMap<Integer,RoutingEntry> entries = new ConcurrentHashMap<Integer,RoutingEntry>();
+
+  RoutingTable(int own_id){
+    entries.put(own_id, new RoutingEntry(0,-1));
+  }
+
+
+  ConcurrentHashMap<Integer,RoutingEntry> get_entries(){
+    return entries;
+  }
+
+
+  synchronized Boolean update_table(ConcurrentHashMap<Integer,RoutingEntry> other, int other_table_owner) {
+    //TODO:
+    Boolean changes_were_made = false;
+
+    Iterator<ConcurrentHashMap.Entry<Integer, RoutingEntry> > 
+      i = other.entrySet().iterator();
+    while (i.hasNext()) {
+       ConcurrentHashMap.Entry<Integer, RoutingEntry> other_entry = i.next();
+      if(entries.get(other_entry.getKey()) == null) {
+        changes_were_made = true;
+
+        RoutingEntry new_entry = new RoutingEntry(other_entry.getValue().distance + 1, other_table_owner);
+        entries.put(other_entry.getKey(), new_entry);
+      }
+      //TODO update when shorter paths are found
+    }
+
+    return changes_were_made;
+  }
+}
+
 
 enum Event_type{
-  PING, PONG, GO, START, INVALID
+  TABLE_UPDATE, 
 }
 
-enum State{
-  NOT_INITIALIZED, INITIALIZED
+enum DEBUG_LEVEL {
+  TRACE, DEBUG, INFO, WARN, ERROR
 }
 
-class Event {
+class Event implements Serializable{
   final Event_type type;
-  final int parameter;
+  final ConcurrentHashMap<Integer,RoutingEntry> routing_table_entries;
+
+  public Event(Event_type type) {
+    this.type = type;
+    this.routing_table_entries = null;
+  }
+
+  public Event(Event_type type, ConcurrentHashMap<Integer,RoutingEntry> routing_table_entries) {
+    this.type = type;
+    this.routing_table_entries = routing_table_entries;
+  }
+}
+
+class SetupError extends Exception{
+}
+
+class Edge{
+  final Channel in;
+  final String in_channel_name;
+  final Channel out;
+  final String out_channel_name;
+
+  Edge (String hostname, String in_channel_name, String out_channel_name) throws SetupError{
+    this.in_channel_name = in_channel_name;
+    this.out_channel_name = out_channel_name;
+    try{
+      this.in = buildChannel(in_channel_name, hostname);
+      this.out = buildChannel(out_channel_name, hostname);
+    } catch (IOException | TimeoutException e) {
+      System.err.println("Setup Error in channel creation: " + e.getMessage());
+      throw new SetupError();
+    }
   
-
-  public Event(Event_type type){
-    this.type = type;
-    this.parameter = -1;
+  
   }
 
-  public Event(Event_type type,int parameter){
-    this.type = type;
-    this.parameter = parameter;
+  private static Channel buildChannel(String channelname, String hostname) throws IOException, TimeoutException {
+    ConnectionFactory factory = new ConnectionFactory();
+    factory.setHost(hostname);
+    Connection connection = factory.newConnection();
+    Channel channel = connection.createChannel();
+    channel.queueDeclare(channelname, false, false, false, null);
+    return channel;
   }
+
+  void send(byte[] body) throws IOException{
+    out.basicPublish("",out_channel_name,null,body);
+  }
+
 }
 
 public class Node {
-  private static boolean DEBUG = false;
-  private static State state = State.NOT_INITIALIZED;
+  private static DEBUG_LEVEL debug_level = DEBUG_LEVEL.DEBUG;
   private static int ID;
-  private static Channel in, out;
-  private static String in_queue_name, out_queue_name;
-
-  private static Channel buildChannel(String channelname) throws IOException, TimeoutException{
-    ConnectionFactory factory = new ConnectionFactory();
-    factory.setHost("localhost");
-    Connection connection = factory.newConnection();
-    Channel channel = connection.createChannel();
-    boolean durable = false;
-    channel.queueDeclare(channelname, durable, false, false, null);
-    return channel;
-  }
-  
-  private static byte[] pack(Event event){
-    return (event.type + " " + event.parameter).getBytes(); 
-  }
-  private static Event unpack(byte[] bytes){
-    try {
-    String s = new String(bytes, "UTF-8");
-    return new Event(
-      Event_type.valueOf(s.split(" ")[0]), 
-      Integer.valueOf(s.split(" ")[1]));
-    } catch (UnsupportedEncodingException e) {
-      System.err.println("[ERROR]: Received message has wrong encoding");
-      System.exit(-1);
-      return new Event(Event_type.INVALID);
-    } catch (IllegalArgumentException e) {
-      System.err.println("[ERROR]: Unable to interpret message as event");
-      return new Event(Event_type.INVALID);
-    }
-    }
-
+  private static RoutingTable physical_routing_table;
+  private static ArrayList<Edge> edges = new ArrayList<Edge>();
+  private static Boolean autoAck = true;
+  private static Boolean initalized = false;
 
   public static void main(String[] argv) throws Exception {
-    if (argv.length < 3) {
-      System.out.println("usage: pingpong <id> <in_queue_name> <out_queue_name>");
+    for (String s : argv) System.out.println(s);
+    if (argv.length < 3 || argv.length %3 != 1) {
+      System.out.println("usage: node <id> <hostname1> <in_queue_name_1> <out_queue_name_1> <hostname2> <in_queue_name_2> <out_queue_name_2> ... ");
       return;
     }
     ID = Integer.valueOf(argv[0]);
-    in_queue_name = argv[1];
-    out_queue_name = argv[2];
+    physical_routing_table = new RoutingTable(ID);
 
-    try {  
-      in = buildChannel(in_queue_name);
-      out = buildChannel(out_queue_name);
-    } catch (IOException | TimeoutException e) {
-      e.printStackTrace();
-      return;
-    }
-
-    Random r = new Random();
-
-    DeliverCallback deliverCallback = (consumerTag, delivery) -> {
-      Event event = unpack(delivery.getBody());
-
-      try{
-        //simulate unpredictable transmission behaviour
-        Thread.sleep(r.nextInt(3000));
-        if (DEBUG) System.out.println("> Received '" + new String(delivery.getBody(),"UTF-8") + "'");
-        handleEvent(event);
-      } catch (InterruptedException | IOException e){
-        e.printStackTrace();
-        System.exit(-1);
-      }
-      in.basicAck(delivery.getEnvelope().getDeliveryTag(), false);
-    };
-    boolean autoAck = false; // acknowledgment is covered below
-    Thread t = new Thread(
-      () -> {
-        do {
-        try{
-          in.basicConsume(in_queue_name, autoAck, deliverCallback, consumerTag -> { });
-        } catch (IOException e) {
-          System.err.println("[IO-Exception] while receiving: " + (e.getMessage()));
-        }
-        } while(true);
-      } 
-    );
-    t.start();
-    receive_commands();
-  }
-
-  private static void receive_commands(){
-        Scanner sc = new Scanner(System.in);
-        while(true) {
-          String _trash = sc.nextLine();
-          try{
-            System.out.println("Delivering Start Command");
-            handleEvent(new Event(Event_type.START));
-          } catch (IOException e) {}
-        }
-  }
-
-  private static synchronized void handleEvent(Event msg) throws IOException{
-    switch (msg.type) {
-      //RULE 1: If I receive a Start command and am not initalized, send a GO(ID) to the other node
-      //RULE 2: Ignore Start if already initialized
-      case Event_type.START:
-        if (DEBUG) System.out.println("Handling START Event");
-        if (state == State.NOT_INITIALIZED){
-          out.basicPublish("",out_queue_name,null,pack(new Event(Event_type.GO,ID)));
-        }
-        break;
-      //RULE 3: If I receive a Go(id) and I am not Initialized 
-      //  If I win (I have smaller ID): send a Ping and set own state to Initalized
-      //  If I lose (I have higher ID): send the GO(ID) back
-      //  [Explaination]: If I lose the other process must win in their RULE 3, so they will start the pingpong
-      //RULE 4: Ignore GO when initialized
-      case Event_type.GO:
-        if (DEBUG) System.out.println("Handling GO Event");
-          if (state == State.NOT_INITIALIZED){
-            if (msg.parameter > ID) {
-              state = State.INITIALIZED;
-              out.basicPublish("",out_queue_name,null,pack(new Event(Event_type.PING)));
-              if (DEBUG) System.out.println(String.format("Received Go and won with %d < %d, sending ping", ID , msg.parameter));
-              System.out.println("ping");
-            } else {
-              if (DEBUG) System.out.println(String.format("Received Go and lost with %d > %d sending GO(%d) back", ID , msg.parameter, ID));
-              out.basicPublish("",out_queue_name,null,pack(new Event(Event_type.GO,ID)));
-              if ((msg.parameter == ID) ){
-                System.err.println(String.format("[ERROR]: BOTH PROCESSES HAVE SAME ID %d %d, BREACH OF CONTRACT => TERMINATING",ID , msg.parameter));
-                System.exit(-1);
-              }
-            }
-          }
-        break;
-      //RULE 5: If I receive a Ping I answer with Pong and set my state to initalized 
-      //[Explanation]: When receiving a Ping a the other process has already determined they have priority 
-      //[Explanation]: No differentiation between state.INITALIZED and state.NOT_INITALIZED needed as both cases respond with pong and want to have the initalized state afterwards. The assignment can be therefore be redundant but that does no harm.
-      case Event_type.PING:
-        if (DEBUG) System.out.println("Handling PING Event");
-        state = State.INITIALIZED;
-        System.out.println("pong");
-        out.basicPublish("",out_queue_name,null,pack(new Event(Event_type.PONG)));
-        break;
-      //RULE 6: If I receive a PONG respond with a PING
-      //[Explanation]: To receive a PONG I must have send a PING beforehand, therefore I am necessarly initalized. No differentiation needed.
-      case Event_type.PONG:
-        if (DEBUG) System.out.println("Handling PONG Event");
-        out.basicPublish("",out_queue_name,null,pack(new Event(Event_type.PING)));
-        System.out.println("ping");
-        break;
-
-      case Event_type.INVALID:
-        System.err.println("[WARNING]: Invalid message will be ignored");
-        
-        break;
-
-      default:
-        System.err.println("[ERROR] Illegal message type");
-        break;
+    for (int i = 1; i + 2 < argv.length; i+=3){
+      edges.add(new Edge(argv[i], argv[i+1], argv[i+2]));
     }
     
+    for (Edge edge : edges) {
+      DeliverCallback deliverCallback = (consumerTag, delivery) -> {
+        try {
+          if (debug_level == DEBUG_LEVEL.TRACE){
+            System.out.println("> Received '" + new String(delivery.getBody(), "UTF-8") + "'");
+          }
+          handleEvent(unpack(delivery.getBody()));
+
+
+        } catch (IOException|ClassNotFoundException e) {
+          e.printStackTrace();
+          System.exit(-1);
+        }
+      }; 
+      Thread t = new Thread(
+          () -> {
+            do {
+              try {
+                edge.in.basicConsume(edge.in_channel_name, autoAck, deliverCallback, cancelCallback -> {
+                });
+              } catch (IOException e) {
+                System.err.println("[IO-Exception] while receiving: " + (e.getMessage()));
+              }
+            } while (true);
+          });
+      t.start();
+    
+    }  
+  join_network();
   }
+
+  private static byte[] pack(Event event) throws IOException{
+    ByteArrayOutputStream bos = new ByteArrayOutputStream(); 
+    ObjectOutputStream oos = new ObjectOutputStream(bos); 
+    oos.writeObject(event);
+    return bos.toByteArray();
+  }
+
+  private static Event unpack(byte[] data) throws IOException, ClassNotFoundException{
+    ByteArrayInputStream bis = new ByteArrayInputStream(data);
+    ObjectInputStream ois = new ObjectInputStream(bis); 
+    return (Event) ois.readObject();
+  }
+
+  private static void join_network() throws IOException {
+    System.out.print("Press [Enter] to join the Network >");
+    Scanner sc = new Scanner(System.in);
+    sc.nextLine();
+    sc.close();
+    System.out.println("[Joining]");
+    
+    byte[] body = pack(new Event(Event_type.TABLE_UPDATE,physical_routing_table.get_entries()));
+
+    if (!initalized) {
+      for (Edge edge: edges) {
+        try{
+          edge.send(body);
+        } catch (IOException e) {
+          System.err.println(e.getMessage());
+          e.printStackTrace();
+        }
+      }
+    }
+
+    //Go into Idle
+    while (true) {
+      try {
+      Thread.sleep(1000);
+      } catch (InterruptedException e){
+        e.printStackTrace();
+        return;
+      }
+      
+    }
+  }
+
+
+  private static synchronized void handleEvent(Event event) throws IOException{
+    switch (event.type) {
+      case Event_type.TABLE_UPDATE:
+        if (debug_level == DEBUG_LEVEL.TRACE || debug_level== DEBUG_LEVEL.DEBUG) System.out.println("Handling Table Update Event");
+        Boolean changes_were_made = physical_routing_table.update_table(event.routing_table_entries, ID);
+        if (changes_were_made) {
+          System.out.print("Table Updated");
+        } else {
+          System.out.print("Nothing new");
+        }
+        break;
+    }
+  }
+
 }
 
