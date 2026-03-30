@@ -10,7 +10,6 @@ import java.io.ObjectOutputStream;
 import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Iterator;
-import java.util.Scanner;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeoutException;
 import java.lang.Thread;
@@ -46,25 +45,38 @@ class RoutingTable{
     return entries;
   }
 
+  void print_table() {
+    for (ConcurrentHashMap.Entry<Integer, RoutingEntry> entry : entries.entrySet()) {
+      System.out.println("Target: " + entry.getKey() + " Distance: " + entry.getValue().distance + " Next Hop: " + entry.getValue().nextHop);
+    }
+  }
 
   //This function updated the nodes own routing table based on the recieved routing table from its neighbor
-  synchronized Boolean update_table(ConcurrentHashMap<Integer,RoutingEntry> other, int other_table_owner) {
+  synchronized Boolean update_table(ConcurrentHashMap<Integer,RoutingEntry> other, int sender_id) {
     Boolean changes_were_made = false;
 
-    Iterator<ConcurrentHashMap.Entry<Integer, RoutingEntry> > 
-      i = other.entrySet().iterator();
-    while (i.hasNext()) {
-       ConcurrentHashMap.Entry<Integer, RoutingEntry> other_entry = i.next();
+    for (ConcurrentHashMap.Entry<Integer, RoutingEntry> other_entry : other.entrySet()) {
 
        //add all previously unknown nodes
        if(entries.get(other_entry.getKey()) == null) {
         changes_were_made = true;
 
-        RoutingEntry new_entry = new RoutingEntry(other_entry.getValue().distance + 1, other_table_owner);
+        RoutingEntry new_entry = new RoutingEntry(other_entry.getValue().distance + 1, sender_id);
+        entries.put(other_entry.getKey(), new_entry);
+      } else if (entries.get(other_entry.getKey()).distance > other_entry.getValue().distance + 1) {
+        changes_were_made = true;
+
+        RoutingEntry new_entry = new RoutingEntry(other_entry.getValue().distance + 1, sender_id);
         entries.put(other_entry.getKey(), new_entry);
       }
-      //add all new faster connections
-      //TODO: Here we need to update the Enries if the new distance is shorter than the old known one
+    }
+    if (Node.debug_level == DEBUG_LEVEL.DEBUG || Node.debug_level == DEBUG_LEVEL.TRACE) {
+      if (changes_were_made) {
+        System.out.println("Updated Routing Table:");
+        print_table();
+      } else if (Node.debug_level == DEBUG_LEVEL.TRACE) {
+        System.out.println("No changes to Routing Table");
+      }
     }
     return changes_were_made;
   }
@@ -72,7 +84,7 @@ class RoutingTable{
 
 // The types of possible Events
 enum Event_type{
-  TABLE_UPDATE, 
+  TABLE_UPDATE,
 }
 
 // Different Debug Levels for testing and demos
@@ -82,17 +94,20 @@ enum DEBUG_LEVEL {
 
 // The actual Events/Messages that are serialized to be transmitted via rabbitMQ
 class Event implements Serializable{
+  final int sender_id;
   final Event_type type;
   final ConcurrentHashMap<Integer,RoutingEntry> routing_table_entries;
 
-  public Event(Event_type type) {
+  public Event(Event_type type, int sender_id) {
     this.type = type;
     this.routing_table_entries = null;
+    this.sender_id = sender_id;
   }
 
-  public Event(Event_type type, ConcurrentHashMap<Integer,RoutingEntry> routing_table_entries) {
+  public Event(Event_type type, ConcurrentHashMap<Integer,RoutingEntry> routing_table_entries, int sender_id) {
     this.type = type;
     this.routing_table_entries = routing_table_entries;
+    this.sender_id = sender_id;
   }
 }
 
@@ -157,27 +172,37 @@ class Edge{
 
 //This class represents a Node in our network. It is the same Class for all Nodes and has no prior information about the rest of the network
 public class Node {
-  private static DEBUG_LEVEL debug_level = DEBUG_LEVEL.INFO;
+  public static final DEBUG_LEVEL debug_level = DEBUG_LEVEL.DEBUG;
   private static int ID;
   private static RoutingTable physical_routing_table;
   private static ArrayList<Edge> edges = new ArrayList<Edge>();
-  private static Boolean initalized = false;
+  private static int logical_left_neighbor;
+  private static int logical_right_neighbor;
 
   // This method sets up the edges, registers the callbacks for incoming messages and lets the user join the network
   public static void main(String[] argv) throws Exception {
-    for (String s : argv) System.out.println(s);
-    if (argv.length < 3 || argv.length %3 != 1) {
-      System.out.println("usage: node <id> <hostname1> <in_queue_name_1> <out_queue_name_1> <hostname2> <in_queue_name_2> <out_queue_name_2> ... ");
+    System.out.println("Starting Node...");
+    if (debug_level == DEBUG_LEVEL.TRACE) {
+      System.out.println("Starting Node with arguments:");
+      for (String arg : argv) {
+        System.out.println(arg);
+      }
+    }
+    if (argv.length < 3 || argv.length %3 != 0) {
+      System.out.println("usage: node <id> <overlay_edge_left> <overlay_edge_right> <hostname1> <in_queue_name_1> <out_queue_name_1> <hostname2> <in_queue_name_2> <out_queue_name_2> ... ");
       return;
     }
     ID = Integer.valueOf(argv[0]);
     physical_routing_table = new RoutingTable(ID);
-
-    for (int i = 1; i + 2 < argv.length; i+=3){
+    logical_left_neighbor = Integer.valueOf(argv[1]);
+    logical_right_neighbor = Integer.valueOf(argv[2]);
+    
+    for (int i = 3; i + 2 < argv.length; i+=3){
       edges.add(new Edge(argv[i], argv[i+1], argv[i+2]));
     }
     
     for (Edge edge : edges) {
+      if(debug_level == DEBUG_LEVEL.TRACE) System.out.println("Registering listener for edge: " + edge.in_channel_name); 
       Thread t = edge.register_message_handler(default_message_handler); 
       t.start();     
     }  
@@ -186,6 +211,7 @@ public class Node {
 
   // The default message handler that is used to handle incoming messages over all edges
   private static DeliverCallback default_message_handler = (consumerTag, delivery) -> {
+
         try {
           if (debug_level == DEBUG_LEVEL.TRACE){
             System.out.println("> Received '" + new String(delivery.getBody(), "UTF-8") + "'");
@@ -218,29 +244,27 @@ public class Node {
   // This mainly consits of sharing ones own Routing table to adjacent nodes.
   // As the own node is part of that table adjacent nodes will adapt their tables respectivly.
   private static void join_network() throws IOException {
-    System.out.print("Press [Enter] to join the Network >");
-    Scanner sc = new Scanner(System.in);
-    sc.nextLine();
-    sc.close();
-    System.out.println("[Joining]");
-    
-    byte[] body = pack(new Event(Event_type.TABLE_UPDATE,physical_routing_table.get_entries()));
+    byte[] body = pack(new Event(Event_type.TABLE_UPDATE,physical_routing_table.get_entries(), ID));
 
-    if (!initalized) {
-      for (Edge edge: edges) {
-        try{
-          edge.send(body);
-        } catch (IOException e) {
-          System.err.println(e.getMessage());
-          e.printStackTrace();
-        }
+    for (Edge edge: edges) {
+      try{
+        if (debug_level == DEBUG_LEVEL.TRACE) System.out.println("Sending own Routing Table to neighbor edge: " + edge.out_channel_name);
+        edge.send(body);
+      } catch (IOException e) {
+        System.err.println(e.getMessage());
+        e.printStackTrace();
       }
     }
+  
 
     //Go into Idle
     while (true) {
       try {
-      Thread.sleep(1000);
+      Thread.sleep(5000);
+      if (debug_level == DEBUG_LEVEL.TRACE) {
+        System.out.println("Current Routing Table of " + ID + ":");
+        physical_routing_table.print_table();
+      }
       } catch (InterruptedException e){
         e.printStackTrace();
         return;
@@ -254,12 +278,21 @@ public class Node {
   // All Rules for our (physical layer) Algorithm are Here
   // TODO: Implement those rules
   private static synchronized void handleEvent(Event event) throws IOException{
+    if (debug_level == DEBUG_LEVEL.TRACE || debug_level== DEBUG_LEVEL.DEBUG) System.out.println("Handling Event: " + event.type);
     switch (event.type) {
       case Event_type.TABLE_UPDATE:
-        if (debug_level == DEBUG_LEVEL.TRACE || debug_level== DEBUG_LEVEL.DEBUG) System.out.println("Handling Table Update Event");
-        Boolean changes_were_made = physical_routing_table.update_table(event.routing_table_entries, ID);
+        Boolean changes_were_made = physical_routing_table.update_table(event.routing_table_entries, event.sender_id);
         if (changes_were_made) {
-          System.out.print("Table Updated");
+          if (debug_level == DEBUG_LEVEL.DEBUG || debug_level == DEBUG_LEVEL.TRACE) System.out.println("Table Updated");
+          // If the table was updated we need to share the new table with all adjacent nodes, so we pack a new message and send it to all edges
+          byte[] body = pack(new Event(Event_type.TABLE_UPDATE,physical_routing_table.get_entries(), ID));
+          for (Edge edge: edges) {
+            try{
+              edge.send(body);
+            } catch (IOException e) {
+              System.err.println("Error occurred while sending message: " + e.getMessage());
+            }
+          }
         } else {
           System.out.print("Nothing new");
         }

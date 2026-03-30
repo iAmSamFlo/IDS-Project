@@ -14,17 +14,18 @@ class Node:
             self.left = virtual_ring[node -2]
         self.right = virtual_ring[node]
         
-        for row in range(len(input_matrix)):
-            for val in range(len(input_matrix[row])):
-                if val > row and input_matrix[row][val] == 1 and (row == node-1 or val == node-1):
-                    outgoing = str(val+1) + "to" + str(row+1)
-                    self.list_of_outgoing.append(outgoing)
-                elif val < row and input_matrix[row][val] == 1 and (row == node-1 or val == node-1):
-                    incoming = str(val+1) + "to" + str(row+1)
-                    self.list_of_incoming.append(incoming)
-                    
-            
-        command = ["java", "test/HelloWorld"]
+        #I don't know why but rabbitmq channels seem to work more reliably when only numbers are involved
+        for i, row in enumerate(input_matrix):
+            for j, val in enumerate(row):
+                if val == 1:
+                    if i == node - 1:
+                        outgoing = f"{i+1}0000000{j+1}"
+                        self.list_of_outgoing.append(outgoing)
+                    elif j == node - 1:
+                        incoming = f"{i+1}0000000{j+1}"
+                        self.list_of_incoming.append(incoming)
+                        
+        command = ["java", "-cp", ".:./dependencies/amqp-client-5.16.0.jar:./dependencies/slf4j-api-1.7.36.jar:./dependencies/slf4j-simple-1.7.36.jar", "Node"]
         command.append(str(node))                   # ID of Node
         command.append(str(self.left))              # When sending to the left which node is allowed to be destination of message
         command.append(str(self.right))             # When sending to the right which node is all to be dest of message
@@ -35,7 +36,7 @@ class Node:
             
             # need to append left and right nodes here which the node is allowed to send message to.
             
-        print(command)
+        print(" ".join(command))
 
         self.process = subprocess.Popen(
                 command, 
@@ -73,9 +74,10 @@ for line in input_matrix:
     print(line)
     
 print("\n Please input the neighbor list of the virtual ring like the following below (first and last needs be the same): \n")
-print("1-2-3-4-5-1 \n")
-    
-virtual_ring = [int(val) for val in input("Enter here: ").strip().split("-")]
+print("1-2-3-4-5-1 (default)\n")
+input_string = input("Enter here: ")
+input_string = input_string if input_string != "" else "1-2-3-4-5-1"
+virtual_ring = [int(val) for val in input_string.strip().split("-")]
 
 nodes = [Node(input_matrix, virtual_ring, i) for i in range(1,len(input_matrix)+1)]
 
