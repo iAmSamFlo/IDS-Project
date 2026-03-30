@@ -19,10 +19,10 @@ class Node:
             for j, val in enumerate(row):
                 if val == 1:
                     if i == node - 1:
-                        outgoing = f"{i+1}0000000{j+1}"
+                        outgoing = f"{i+1}000000{j+1}"
                         self.list_of_outgoing.append(outgoing)
                     elif j == node - 1:
-                        incoming = f"{i+1}0000000{j+1}"
+                        incoming = f"{i+1}000000{j+1}"
                         self.list_of_incoming.append(incoming)
                         
         command = ["java", "-cp", ".:./dependencies/amqp-client-5.16.0.jar:./dependencies/slf4j-api-1.7.36.jar:./dependencies/slf4j-simple-1.7.36.jar", "Node"]

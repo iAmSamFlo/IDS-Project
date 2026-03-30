@@ -202,7 +202,6 @@ public class Node {
     }
     
     for (Edge edge : edges) {
-      if(debug_level == DEBUG_LEVEL.TRACE) System.out.println("Registering listener for edge: " + edge.in_channel_name); 
       Thread t = edge.register_message_handler(default_message_handler); 
       t.start();     
     }  
@@ -211,7 +210,6 @@ public class Node {
 
   // The default message handler that is used to handle incoming messages over all edges
   private static DeliverCallback default_message_handler = (consumerTag, delivery) -> {
-
         try {
           if (debug_level == DEBUG_LEVEL.TRACE){
             System.out.println("> Received '" + new String(delivery.getBody(), "UTF-8") + "'");
