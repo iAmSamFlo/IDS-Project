@@ -1,0 +1,14 @@
+
+*.class
+
+*.log
+
+.vscode/
+
+.idea/
+
+# OS files
+.DS_Store
+
+out/
+build/

@@ -85,6 +85,7 @@ class RoutingTable{
 // The types of possible Events
 enum Event_type{
   TABLE_UPDATE,
+  ONE_RING_STEP
 }
 
 // Different Debug Levels for testing and demos
@@ -98,16 +99,41 @@ class Event implements Serializable{
   final Event_type type;
   final ConcurrentHashMap<Integer,RoutingEntry> routing_table_entries;
 
+  final int next_stop;
+  final int final_stop;
+  final int direction;
+  final String message; 
+
   public Event(Event_type type, int sender_id) {
     this.type = type;
     this.routing_table_entries = null;
     this.sender_id = sender_id;
+
+    this.next_stop = -1;
+    this.final_stop = -1;
+    this.direction = 0;
+    this.message = null;
   }
 
   public Event(Event_type type, ConcurrentHashMap<Integer,RoutingEntry> routing_table_entries, int sender_id) {
     this.type = type;
     this.routing_table_entries = routing_table_entries;
     this.sender_id = sender_id;
+
+    this.next_stop = -1;
+    this.final_stop = -1;
+    this.direction = 0;
+    this.message = null;
+  }
+
+  public Event(int sender_id, int next_stop, int final_stop, int direction, String message){
+    this.type = Event_type.ONE_RING_STEP;
+    this.sender_id = sender_id;
+    this.next_stop = next_stop;
+    this.final_stop = final_stop;
+    this.direction = direction;
+    this.message = message;
+    this.routing_table_entries = null;
   }
 }
 
@@ -238,6 +264,45 @@ public class Node {
     return (Event) ois.readObject();
   }
 
+  private static void sendTo(int nextStop, Event event) throws IOException {
+    RoutingEntry entry = physical_routing_table.get_entries().get(nextStop)
+
+    if(entry==null){
+      System.out.println("No feasible route to " + nextStop);
+      return;
+    }
+
+    int nextHop = entry.nextHop;
+    byte[] body = pack(event);
+    //simple test
+    for(Edge edge : edges){
+      edge.send(body)
+    }
+  }
+
+  private static void ringMsg(int finalStop, int direction, String msg) throws IOException {
+    int firstStop = (direction == -1) ? logical_left_neighbor : logical_right_neighbor;
+    Event e = new Event(ID, firstStop, finalStop, direction, msg);
+    System.out.println("Starting ring message from " + ID);
+    sendTo(firstStop, e);
+  }
+
+  private static void handleRingStep(Event e) throws IOException{
+    if(ID != e.next_stop){
+      sendTo(e.next_stop, e);
+      return;
+    }
+    System.out.println("Node " + ID + " got message: " + e.message);
+
+    if(ID == e.final_stop){
+      System.out.println("Final destination reached " + "ID");
+      return;
+    }
+    int nextStop = (e.direction == -1) ? logical_left_neighbor : logical_right_neighbor;
+    Event next = new Event(ID, nextStop, e.final_stop, e.direction,e.message);
+    sendTo(nextStop, next);
+  }
+
   // This function waits for user input to initialize the network joining procedure
   // This mainly consits of sharing ones own Routing table to adjacent nodes.
   // As the own node is part of that table adjacent nodes will adapt their tables respectivly.
@@ -291,9 +356,13 @@ public class Node {
               System.err.println("Error occurred while sending message: " + e.getMessage());
             }
           }
-        } else {
+        } 
+        else {
           System.out.print("Nothing new");
         }
+        break;
+      case ONE_RING_STEP:
+        handleRingStep(event);
         break;
     }
   }
